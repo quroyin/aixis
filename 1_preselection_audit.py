@@ -6,8 +6,13 @@ Leakage detection and redundancy pre-filtering BEFORE feature selection.
 Pipeline position:
     Phase 1 (Cleaned OHLCV) → [Stage 0: Preselection Audit] → Stage 1 (Individual Evaluation)
 
-Version: 1.0.7
+Version: 1.0.9
 Changelog:
+    - v1.0.9: Clean terminal formatting (print utilities), silenced MFI FutureWarning
+              in worker via catch_warnings context manager, verbose=0 for joblib
+    - v1.0.8: Replaced sequential tqdm loop with joblib Parallel/delayed (loky backend),
+              extracted filter_tickers_by_history() and _process_ticker_worker() to
+              module level for pickling compatibility
     - v1.0.7: Fixed alphabetical bias in redundancy clustering (select rep by |ρ| vs target),
               removed dead exclude_candlestick block, fixed n_tickers to use nunique()
     - v1.0.6: Fixed pandas_ta FutureWarning — now suppressed BEFORE library execution
@@ -24,7 +29,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -44,7 +49,7 @@ warnings.filterwarnings(
 )
 
 import pandas_ta_classic as ta  # noqa: E402 (import after filter is intentional)
-from tqdm import tqdm
+from joblib import Parallel, delayed
 
 # ═══════════════════════════════════════════════════════════════
 # PATH SETUP — Must be BEFORE all project imports
@@ -85,11 +90,32 @@ _MANIFEST_SAMPLE_ROWS: int = 1000
 
 _DEFAULT_ANOMALY_THRESHOLD: float = 0.3
 _DEFAULT_REDUNDANCY_THRESHOLD: float = 0.85
+_PARALLEL_N_JOBS: int = 6
 
 
 # ═══════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS (module-level)
 # ═══════════════════════════════════════════════════════════════
+
+def _print_box(title: str, width: int = 60) -> None:
+    """Print a clean centered header box."""
+    padding = (width - len(title) - 2) // 2
+    print(f"\n{'=' * width}")
+    print(f"{' ' * padding} {title}")
+    print(f"{'=' * width}\n")
+
+
+def _print_section(title: str) -> None:
+    """Print a clean section divider."""
+    print(f"\n{'─' * 60}")
+    print(f"  {title}")
+    print(f"{'─' * 60}\n")
+
+
+def _print_kv(key: str, value: Any, indent: int = 2) -> None:
+    """Print a key-value pair with consistent formatting."""
+    print(f"{' ' * indent}{key:<25s}: {value}")
+
 
 def compute_file_hash(path: Path) -> str:
     """
@@ -108,6 +134,81 @@ def compute_file_hash(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             sha256.update(chunk)
     return sha256.hexdigest()
+
+
+def filter_tickers_by_history(
+    df: pd.DataFrame,
+    min_rows: int,
+) -> Tuple[List[Tuple[str, pd.DataFrame]], List[str]]:
+    """
+    Split tickers into those meeting the minimum history requirement and those
+    that do not.
+
+    Args:
+        df: Multi-ticker OHLCV dataframe with a 'ticker' column.
+        min_rows: Minimum number of rows required to process a ticker.
+
+    Returns:
+        Tuple of (ticker_groups, skipped_messages) where ticker_groups is a
+        list of (ticker, ticker_df) pairs for eligible tickers and
+        skipped_messages contains human-readable reasons for skipped ones.
+    """
+    ticker_groups: List[Tuple[str, pd.DataFrame]] = []
+    skipped_tickers: List[str] = []
+
+    for ticker in sorted(df["ticker"].unique()):
+        ticker_df = df[df["ticker"] == ticker].copy()
+
+        if len(ticker_df) < min_rows:
+            skipped_tickers.append(
+                f"{ticker} ({len(ticker_df)} rows < {min_rows} min)"
+            )
+            continue
+
+        ticker_groups.append((ticker, ticker_df))
+
+    return ticker_groups, skipped_tickers
+
+
+def _process_ticker_worker(
+    ticker: str,
+    ticker_df: pd.DataFrame,
+    curated_indicators: List[Dict[str, Any]],
+) -> Tuple[str, Optional[pd.DataFrame], Optional[str]]:
+    """
+    Worker function for joblib parallel indicator generation.
+
+    Runs in a separate loky process. Each worker:
+        1. Builds its own ta.Strategy (avoids pickling issues)
+        2. Sets pandas_ta internal cores=1 (outer parallelism handles concurrency)
+        3. Suppresses upstream FutureWarning inside context manager
+        4. Applies the strategy to a single ticker's dataframe
+
+    Args:
+        ticker: Ticker symbol (for error reporting).
+        ticker_df: Single-ticker OHLCV dataframe (pre-filtered, pre-copied).
+        curated_indicators: List of indicator dicts from config.
+
+    Returns:
+        Tuple of (ticker, result_df_or_None, error_message_or_None).
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+
+            ticker_df.ta.cores = 1
+
+            strategy = ta.Strategy(
+                name="curated_phase2",
+                ta=curated_indicators,
+            )
+
+            ticker_df.ta.strategy(strategy)
+
+        return (ticker, ticker_df, None)
+
+    except Exception as e:
+        return (ticker, None, str(e))
 
 
 def greedy_correlation_clustering(
@@ -202,38 +303,21 @@ class PreselectionAuditor:
 
     def generate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply curated pandas_ta strategy to each ticker SEQUENTIALLY.
+        Apply curated pandas_ta strategy to each ticker in PARALLEL via joblib.
 
-        Why not multiprocessing.Pool:
-            pandas_ta_classic internally spawns child processes for
-            certain indicators. Python's multiprocessing.Pool uses
-            daemon workers, and daemon processes cannot have children.
-            This causes: "daemonic processes are not allowed to have children"
-
-            Sequential per-ticker processing avoids this entirely.
-            pandas_ta's own internal parallelism still utilizes multiple
-            cores where the library supports it.
+        Uses the loky backend with _PARALLEL_N_JOBS workers. Each worker runs
+        _process_ticker_worker() which builds its own ta.Strategy to avoid
+        pickling issues and suppresses the MFI FutureWarning via a
+        catch_warnings context manager.
 
         Temporal integrity:
             - Each ticker processed independently (no cross-ticker leakage)
             - All indicators are backward-looking only
             - Tickers with < min_rows_per_ticker are skipped
         """
-        tickers = df["ticker"].unique()
-        ticker_groups = []
-        skipped_tickers = []
-
-        for ticker in sorted(tickers):  # Deterministic ordering
-            ticker_df = df[df["ticker"] == ticker].copy()
-
-            if len(ticker_df) < self.config.min_rows_per_ticker:
-                skipped_tickers.append(
-                    f"{ticker} ({len(ticker_df)} rows < "
-                    f"{self.config.min_rows_per_ticker} min)"
-                )
-                continue
-
-            ticker_groups.append((ticker, ticker_df))
+        ticker_groups, skipped_tickers = filter_tickers_by_history(
+            df, self.config.min_rows_per_ticker
+        )
 
         if skipped_tickers:
             print(f"[Stage 0] Skipped {len(skipped_tickers)} tickers "
@@ -249,38 +333,28 @@ class PreselectionAuditor:
                 f"Cannot generate indicators."
             )
 
-        # Build the pandas_ta strategy once (reused for every ticker)
-        strategy = ta.Strategy(
-            name="curated_phase2",
-            ta=self.config.curated_indicators,
-        )
+        _print_kv("Tickers", f"{len(ticker_groups)} (n_jobs={_PARALLEL_N_JOBS}, loky)")
 
-        print(f"[Stage 0] Generating indicators for {len(ticker_groups)} "
-              f"tickers (sequential — pandas_ta handles internal parallelism)...")
+        results = Parallel(n_jobs=_PARALLEL_N_JOBS, backend="loky", verbose=0)(
+            delayed(_process_ticker_worker)(
+                ticker, ticker_df, self.config.curated_indicators
+            )
+            for ticker, ticker_df in ticker_groups
+        )
 
         valid_results: List[pd.DataFrame] = []
 
-        for ticker, ticker_df in tqdm(
-            ticker_groups,
-            desc="Indicator generation",
-            unit="ticker",
-        ):
-            try:
-                # pandas_ta .strategy() appends columns in-place
-                # FutureWarning suppressed globally at module import
-                ticker_df.ta.strategy(strategy)
-
-                valid_results.append(ticker_df)
-
-            except Exception as e:
+        for ticker, result_df, error in results:
+            if error:
                 self._generation_errors.append(ticker)
-                # Only warn for first 5 failures to avoid log spam
                 if len(self._generation_errors) <= 5:
                     warnings.warn(
-                        f"[Stage 0] pandas_ta failed for '{ticker}': {e}",
+                        f"[Stage 0] pandas_ta failed for '{ticker}': {error}",
                         RuntimeWarning,
                         stacklevel=2,
                     )
+            else:
+                valid_results.append(result_df)
 
         if not valid_results:
             raise RuntimeError(
@@ -306,9 +380,9 @@ class PreselectionAuditor:
         n_indicators = len(self._get_feature_columns(combined))
         n_success = len(valid_results)
         n_failed = len(self._generation_errors)
-        print(f"[Stage 0] Generated {n_indicators} indicator columns "
-              f"across {n_success} tickers "
-              f"({n_failed} failed)")
+        _print_kv("Indicators generated", n_indicators)
+        _print_kv("Tickers succeeded", n_success)
+        _print_kv("Tickers failed", n_failed)
 
         return combined
 
@@ -359,8 +433,8 @@ class PreselectionAuditor:
 
         n_valid = df["target_log_return"].notna().sum()
         n_nan = df["target_log_return"].isna().sum()
-        print(f"[Stage 0] Target computed: {n_valid} valid, "
-              f"{n_nan} NaN (temporal boundary)")
+        _print_kv("Valid targets", f"{n_valid:,}")
+        _print_kv("NaN (boundary)", f"{n_nan:,}")
 
         return df
 
@@ -433,12 +507,11 @@ class PreselectionAuditor:
 
         self._leakage_flagged = flagged_features
 
-        print(f"\n[Stage 0] Leakage Detection Report:")
-        print(f"  Features analyzed     : {len(correlations)}")
-        print(f"  Computation failures  : {len(computation_failures)}")
-        print(f"  Anomaly threshold     : |ρ| > {threshold}")
-        print(f"  Flagged (suspicious)  : {len(flagged_features)}")
-        print(f"  Known leaky found     : {len(known_leaky_found)}")
+        _print_kv("Features analyzed", len(correlations))
+        _print_kv("Computation failures", len(computation_failures))
+        _print_kv("Anomaly threshold", f"|ρ| > {threshold}")
+        _print_kv("Flagged (suspicious)", len(flagged_features))
+        _print_kv("Known leaky found", len(known_leaky_found))
 
         if flagged_features:
             print(f"  Top flagged features:")
@@ -518,13 +591,12 @@ class PreselectionAuditor:
         self._redundancy_dropped = dropped_as_redundant
 
         n_multi = sum(1 for c in clusters if len(c) > 1)
-        print(f"[Stage 0] Redundancy Clustering Report:")
-        print(f"  Total features       : {len(feature_cols)}")
-        print(f"  Correlation threshold : |r| > {threshold}")
-        print(f"  Clusters formed      : {len(clusters)}")
-        print(f"  Multi-member clusters: {n_multi}")
-        print(f"  Representatives kept : {len(representatives)}")
-        print(f"  Dropped as redundant : {len(dropped_as_redundant)}")
+        _print_kv("Total features", len(feature_cols))
+        _print_kv("Correlation threshold", f"|r| > {threshold}")
+        _print_kv("Clusters formed", len(clusters))
+        _print_kv("Multi-member clusters", n_multi)
+        _print_kv("Representatives kept", len(representatives))
+        _print_kv("Dropped as redundant", len(dropped_as_redundant))
 
         if n_multi > 0:
             print(f"  Largest clusters:")
@@ -556,18 +628,17 @@ class PreselectionAuditor:
 
         self.auditor.start()
 
-        print("=" * 70)
-        print("Phase 2 — Stage 0: Preselection Audit")
-        print("=" * 70)
-        print(f"  Config version : {self.config.version}")
-        print(f"  PROJECT_ROOT   : {PROJECT_ROOT}")
-        print(f"  Input          : {self.config.get_resolved_input_path()}")
-        print(f"  Output dir     : {output_dir}")
-        print(f"  Target horizon : {self.config.target_horizon} days")
-        print(f"  Indicators     : {self.config.get_indicator_count()} curated")
+        _print_box("PHASE 2 — STAGE 0: PRESELECTION AUDIT")
+        _print_kv("Config version", self.config.version)
+        _print_kv("Project root", PROJECT_ROOT)
+        _print_kv("Input", self.config.get_resolved_input_path())
+        _print_kv("Output dir", output_dir)
+        _print_kv("Target horizon", f"{self.config.target_horizon} days")
+        _print_kv("Indicators", f"{self.config.get_indicator_count()} curated")
+        _print_kv("Parallel jobs", f"{_PARALLEL_N_JOBS} (loky)")
 
         # ── 1. Load and validate Phase 1 data ───────────────────
-        print(f"\n[Stage 0] Loading Phase 1 data...")
+        print(f"\n  Loading Phase 1 data...")
         input_path = self.config.get_resolved_input_path()
         input_hash = compute_file_hash(input_path)
 
@@ -586,34 +657,27 @@ class PreselectionAuditor:
         self.auditor.record_input(str(input_path), raw_df)
 
         n_tickers = raw_df["ticker"].nunique()
-        print(f"  Loaded: {len(raw_df)} rows, {n_tickers} tickers")
-        print(f"  Input SHA-256: {input_hash[:16]}...")
+        _print_kv("Rows", f"{len(raw_df):,}")
+        _print_kv("Tickers", n_tickers)
+        _print_kv("SHA-256", f"{input_hash[:16]}...")
 
         # ── 2. Generate indicators ──────────────────────────────
-        print(f"\n{'─' * 50}")
-        print(f"[Stage 0] Step 1/4: Indicator Generation")
-        print(f"{'─' * 50}")
+        _print_section("Step 1/4 · Indicator Generation")
 
         indicator_df = self.generate_indicators(raw_df)
 
         # ── 3. Compute target ───────────────────────────────────
-        print(f"\n{'─' * 50}")
-        print(f"[Stage 0] Step 2/4: Target Computation")
-        print(f"{'─' * 50}")
+        _print_section("Step 2/4 · Target Computation")
 
         target_df = self.compute_target(indicator_df)
 
         # ── 4. Leakage detection ────────────────────────────────
-        print(f"\n{'─' * 50}")
-        print(f"[Stage 0] Step 3/4: Leakage Detection")
-        print(f"{'─' * 50}")
+        _print_section("Step 3/4 · Leakage Detection")
 
         leakage_report = self.detect_leakage_anomalies(target_df)
 
         # ── 5. Redundancy clustering ────────────────────────────
-        print(f"\n{'─' * 50}")
-        print(f"[Stage 0] Step 4/4: Redundancy Clustering")
-        print(f"{'─' * 50}")
+        _print_section("Step 4/4 · Redundancy Clustering")
 
         redundancy_report = self.cluster_redundant_features(
             target_df,
@@ -632,20 +696,17 @@ class PreselectionAuditor:
             set(self._redundancy_dropped) - flagged
         )
 
-        print(f"\n{'═' * 70}")
-        print(f"[Stage 0] CANDIDATE FEATURE SUMMARY")
-        print(f"{'═' * 70}")
-
         all_features = sorted(self._get_feature_columns(target_df))
-        print(f"  Total generated features    : {len(all_features)}")
-        print(f"  Removed (leakage flagged)   : {len(leakage_report['flagged_features'])}")
-        print(f"  Removed (redundancy)        : {len(self._redundancy_dropped)}")
-        print(f"  Removed (overlap leak+red)  : {len(removed_by_leakage)}")
-        print(f"  ─────────────────────────────")
-        print(f"  Candidates for Stage 1      : {len(candidates)}")
+        _print_box("CANDIDATE FEATURE SUMMARY")
+        _print_kv("Total generated", len(all_features))
+        _print_kv("Removed (leakage)", len(leakage_report['flagged_features']))
+        _print_kv("Removed (redundancy)", len(self._redundancy_dropped))
+        _print_kv("Removed (overlap)", len(removed_by_leakage))
+        print(f"  {'─' * 40}")
+        _print_kv("Candidates → Stage 1", len(candidates))
 
         # ── 7. Save output artifacts ────────────────────────────
-        print(f"\n[Stage 0] Saving artifacts...")
+        _print_section("Saving Artifacts")
 
         candidate_path = output_dir / "candidate_features.csv"
         candidate_df = pd.DataFrame({
@@ -654,11 +715,11 @@ class PreselectionAuditor:
             "source": "preselection_audit_v" + self.config.version,
         })
         write_csv(candidate_df, candidate_path)
-        print(f"  ✓ {candidate_path} ({len(candidates)} features)")
+        print(f"  ✓ {candidate_path.name} ({len(candidates)} features)")
 
         corr_path = output_dir / "correlation_matrix.parquet"
         write_parquet(corr_matrix, corr_path, compression=self.config.compression)
-        print(f"  ✓ {corr_path} ({corr_matrix.shape[0]}×{corr_matrix.shape[1]})")
+        print(f"  ✓ {corr_path.name} ({corr_matrix.shape[0]}×{corr_matrix.shape[1]})")
 
         t_elapsed = time.time() - t_start
 
@@ -722,7 +783,7 @@ class PreselectionAuditor:
 
         report_path = output_dir / "preselection_report.json"
         write_json(report, report_path)
-        print(f"  ✓ {report_path}")
+        print(f"  ✓ {report_path.name}")
 
         # ── 8. Complete audit lifecycle ─────────────────────────
         # Sample for audit manifest — full dataset may be 600K+ rows
@@ -730,10 +791,7 @@ class PreselectionAuditor:
         self.auditor.record_output(output_df, self.config.to_snapshot())
         self.auditor.success()
 
-        print(f"\n{'═' * 70}")
-        print(f"[Stage 0] Preselection audit COMPLETE in {t_elapsed:.1f}s")
-        print(f"  → {len(candidates)} candidate features ready for Stage 1")
-        print(f"{'═' * 70}")
+        _print_box(f"COMPLETE — {len(candidates)} candidates → Stage 1  [{t_elapsed:.0f}s]")
 
         return report
 
@@ -763,15 +821,16 @@ if __name__ == "__main__":
     auditor = PreselectionAuditor(config)
     report = auditor.run_audit()
 
-    print(f"\nCandidate features ({report['output']['candidate_count']}):")
-    for feat in report["output"]["candidates"][:20]:
-        print(f"  ✓ {feat}")
-    if report['output']['candidate_count'] > 20:
-        print(f"  ... and {report['output']['candidate_count'] - 20} more")
+    # ── Clean candidate table ────────────────────────────
+    n_candidates = report["output"]["candidate_count"]
+    _print_section(f"Candidate Features ({n_candidates})")
+    for i, feat in enumerate(report["output"]["candidates"], 1):
+        print(f"  {i:>3d}. {feat}")
 
-    if report["leakage_detection"]["features_flagged"]:
-        print(f"\n⚠ Leakage-flagged features "
-              f"({len(report['leakage_detection']['features_flagged'])}):")
-        for feat in report["leakage_detection"]["features_flagged"][:10]:
+    # ── Leakage warnings ─────────────────────────────────
+    flagged = report["leakage_detection"]["features_flagged"]
+    if flagged:
+        _print_section(f"Leakage-Flagged Features ({len(flagged)})")
+        for feat in flagged[:10]:
             corr = report["leakage_detection"]["top_correlations"].get(feat, "N/A")
-            print(f"  ✗ {feat}  (ρ = {corr})")
+            print(f"    ✗ {feat:<35s}  ρ = {corr}")
