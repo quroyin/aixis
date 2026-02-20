@@ -6,8 +6,10 @@ Leakage detection and redundancy pre-filtering BEFORE feature selection.
 Pipeline position:
     Phase 1 (Cleaned OHLCV) → [Stage 0: Preselection Audit] → Stage 1 (Individual Evaluation)
 
-Version: 1.0.6
+Version: 1.0.7
 Changelog:
+    - v1.0.7: Fixed alphabetical bias in redundancy clustering (select rep by |ρ| vs target),
+              removed dead exclude_candlestick block, fixed n_tickers to use nunique()
     - v1.0.6: Fixed pandas_ta FutureWarning — now suppressed BEFORE library execution
     - v1.0.5: Fixed version mismatch, removed unused imports, moved hash to module level
     - v1.0.4: Fixed pandas FutureWarning, magic numbers, redundant checks
@@ -268,16 +270,6 @@ class PreselectionAuditor:
                 # FutureWarning suppressed globally at module import
                 ticker_df.ta.strategy(strategy)
 
-                # Remove candlestick pattern columns if configured
-                if self.config.exclude_candlestick:
-                    candlestick_cols = [
-                        col for col in ticker_df.columns
-                        if col.startswith("CDL_")
-                    ]
-                    ticker_df = ticker_df.drop(
-                        columns=candlestick_cols, errors="ignore"
-                    )
-
                 valid_results.append(ticker_df)
 
             except Exception as e:
@@ -469,8 +461,27 @@ class PreselectionAuditor:
         self,
         df: pd.DataFrame,
         threshold: float = _DEFAULT_REDUNDANCY_THRESHOLD,
+        target_correlations: Dict[str, float] = None,
     ) -> Dict[str, Any]:
-        """Group redundant features via greedy correlation clustering."""
+        """Group redundant features via greedy correlation clustering.
+
+        The representative of each cluster is chosen as the member with the
+        highest absolute Spearman correlation to the target.  Ties are broken
+        alphabetically (deterministic).  Features whose target correlation
+        cannot be computed (all-NaN, etc.) default to 0.0 so they are least
+        preferred.
+
+        Args:
+            df: DataFrame containing feature columns.
+            threshold: Absolute correlation threshold for grouping.
+            target_correlations: Dict mapping feature name → Spearman ρ vs
+                target (pre-computed by detect_leakage_anomalies).  When
+                omitted, all features default to 0.0 and the representative
+                falls back to alphabetical order.
+        """
+        if target_correlations is None:
+            target_correlations = {}
+
         feature_cols = sorted(self._get_feature_columns(df))
 
         analysis_df = df[feature_cols].dropna(how="all")
@@ -490,9 +501,19 @@ class PreselectionAuditor:
         dropped_as_redundant: List[str] = []
 
         for cluster in clusters:
-            representatives.append(cluster[0])
-            for feat in cluster[1:]:
-                dropped_as_redundant.append(feat)
+            # Select member with highest |ρ| vs target; break ties alphabetically
+            best_abs_rho = max(abs(target_correlations.get(f, 0.0)) for f in cluster)
+            rep = min(
+                (f for f in cluster if abs(target_correlations.get(f, 0.0)) == best_abs_rho),
+                key=lambda f: f,
+            )
+            representatives.append(rep)
+            for feat in cluster:
+                if feat != rep:
+                    dropped_as_redundant.append(feat)
+
+        # Build (cluster, rep) pairs for reporting
+        cluster_rep_pairs = list(zip(clusters, representatives))
 
         self._redundancy_dropped = dropped_as_redundant
 
@@ -507,18 +528,22 @@ class PreselectionAuditor:
 
         if n_multi > 0:
             print(f"  Largest clusters:")
-            sorted_clusters = sorted(clusters, key=len, reverse=True)
-            for cluster in sorted_clusters[:5]:
+            sorted_pairs = sorted(cluster_rep_pairs, key=lambda x: len(x[0]), reverse=True)
+            for cluster, rep in sorted_pairs[:5]:
                 if len(cluster) > 1:
+                    rep_rho = target_correlations.get(rep, 0.0)
+                    others = [f for f in cluster if f != rep]
                     print(f"    [{len(cluster)} members] "
-                          f"rep='{cluster[0]}' ← {cluster[1:]}")
+                          f"rep='{rep}' (ρ={rep_rho:+.4f}) ← {others}")
 
         return {
             "clusters": clusters,
+            "cluster_rep_pairs": cluster_rep_pairs,
             "representatives": representatives,
             "dropped_as_redundant": dropped_as_redundant,
             "correlation_matrix": corr_matrix,
             "threshold": threshold,
+            "target_correlations": target_correlations,
         }
 
     # ── MAIN ENTRY POINT ────────────────────────────────────────
@@ -560,7 +585,7 @@ class PreselectionAuditor:
 
         self.auditor.record_input(str(input_path), raw_df)
 
-        n_tickers = raw_df["ticker"].unique()
+        n_tickers = raw_df["ticker"].nunique()
         print(f"  Loaded: {len(raw_df)} rows, {n_tickers} tickers")
         print(f"  Input SHA-256: {input_hash[:16]}...")
 
@@ -590,7 +615,10 @@ class PreselectionAuditor:
         print(f"[Stage 0] Step 4/4: Redundancy Clustering")
         print(f"{'─' * 50}")
 
-        redundancy_report = self.cluster_redundant_features(target_df)
+        redundancy_report = self.cluster_redundant_features(
+            target_df,
+            target_correlations=leakage_report["correlations"],
+        )
         corr_matrix = redundancy_report.pop("correlation_matrix")
 
         # ── 6. Compile candidate feature list ───────────────────
@@ -646,7 +674,7 @@ class PreselectionAuditor:
             },
             "indicator_generation": {
                 "total_indicators_generated": len(all_features),
-                "tickers_processed": len(raw_df["ticker"].unique()) - len(self._generation_errors),
+                "tickers_processed": raw_df["ticker"].nunique() - len(self._generation_errors),
                 "tickers_failed": self._generation_errors,
                 "curated_strategy_used": self.config.use_curated_strategy,
                 "indicator_definitions": self.config.get_indicator_count(),
@@ -672,9 +700,14 @@ class PreselectionAuditor:
                 "representatives": redundancy_report["representatives"],
                 "dropped_as_redundant": redundancy_report["dropped_as_redundant"],
                 "cluster_details": [
-                    {"representative": c[0], "members": c, "size": len(c)}
-                    for c in redundancy_report["clusters"]
-                    if len(c) > 1
+                    {
+                        "representative": rep,
+                        "representative_target_rho": redundancy_report["target_correlations"].get(rep, 0.0),
+                        "members": cluster,
+                        "size": len(cluster),
+                    }
+                    for cluster, rep in redundancy_report["cluster_rep_pairs"]
+                    if len(cluster) > 1
                 ],
             },
             "output": {
