@@ -3,8 +3,9 @@ Phase 2: Feature Generation Configuration
 ==========================================
 Frozen configuration for Phase 2 (Technical Indicator Generation).
 
-Version: 1.0.5
+Version: 1.0.6
 Changelog:
+    - v1.0.6: Bumped version to match script v1.1.0 changes
     - v1.0.5: Fixed hardware portability, category list, indicator validation
     - v1.0.4: Fixed path resolution for cwd-independence
     - v1.0.3: Standalone frozen dataclass (no PhaseConfig inheritance)
@@ -286,7 +287,7 @@ def get_phase2_config(**overrides) -> Phase2Config:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Phase 2 Configuration — Self-Test (v1.0.5)")
+    print("Phase 2 Configuration — Self-Test (v1.0.6)")
     print("=" * 60)
     print(f"  PROJECT_ROOT     : {PROJECT_ROOT}")
     print(f"  Detected CPUs    : {os.cpu_count()}")
