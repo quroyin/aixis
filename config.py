@@ -140,7 +140,7 @@ class Phase2Config:
     """
 
     phase: int = 2
-    version: str = "1.0.5"
+    version: str = "1.0.6"
 
     input_path: str = "artifacts/phase_1_data/merged_data.parquet"
     output_dir: str = "artifacts/phase_2_features"
