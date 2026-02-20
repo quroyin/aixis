@@ -6,8 +6,11 @@ Leakage detection and redundancy pre-filtering BEFORE feature selection.
 Pipeline position:
     Phase 1 (Cleaned OHLCV) → [Stage 0: Preselection Audit] → Stage 1 (Individual Evaluation)
 
-Version: 1.0.9
+Version: 1.1.0
 Changelog:
+    - v1.1.0: Fixed MFI FutureWarning leak in loky workers (removed catch_warnings,
+              set filter directly), fixed float equality in rep selection (use sorted),
+              bumped config version to 1.0.6
     - v1.0.9: Clean terminal formatting (print utilities), silenced MFI FutureWarning
               in worker via catch_warnings context manager, verbose=0 for joblib
     - v1.0.8: Replaced sequential tqdm loop with joblib Parallel/delayed (loky backend),
@@ -192,18 +195,24 @@ def _process_ticker_worker(
     Returns:
         Tuple of (ticker, result_df_or_None, error_message_or_None).
     """
+    # Suppress MFI FutureWarning in loky child process.
+    # loky workers do NOT inherit the parent's warning filters,
+    # so we must set them here. No need for catch_warnings()
+    # since worker processes are disposable.
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message="Setting an item of incompatible dtype",
+    )
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
+        ticker_df.ta.cores = 1
 
-            ticker_df.ta.cores = 1
+        strategy = ta.Strategy(
+            name="curated_phase2",
+            ta=curated_indicators,
+        )
 
-            strategy = ta.Strategy(
-                name="curated_phase2",
-                ta=curated_indicators,
-            )
-
-            ticker_df.ta.strategy(strategy)
+        ticker_df.ta.strategy(strategy)
 
         return (ticker, ticker_df, None)
 
@@ -574,12 +583,13 @@ class PreselectionAuditor:
         dropped_as_redundant: List[str] = []
 
         for cluster in clusters:
-            # Select member with highest |ρ| vs target; break ties alphabetically
-            best_abs_rho = max(abs(target_correlations.get(f, 0.0)) for f in cluster)
-            rep = min(
-                (f for f in cluster if abs(target_correlations.get(f, 0.0)) == best_abs_rho),
-                key=lambda f: f,
-            )
+            # Select member with highest |ρ| vs target.
+            # Ties broken alphabetically (deterministic).
+            # Avoids float equality — sort by (-|ρ|, name) and take first.
+            rep = sorted(
+                cluster,
+                key=lambda f: (-abs(target_correlations.get(f, 0.0)), f),
+            )[0]
             representatives.append(rep)
             for feat in cluster:
                 if feat != rep:
